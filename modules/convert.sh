@@ -1,10 +1,8 @@
 
 #!/bin/sh
-# BACUSP - BP v1 Converter
-# Uso:
-#   bacusp convert ORIGEN
-#   bacusp convert ORIGEN DESTINO.bp
-#   bacusp convert --portable ORIGEN [DESTINO.bp]
+# BACUSP - Multiplatform BP Converter
+# Creates BP v1 packages with directory-based platform variants.
+# Does not translate executable code.
 
 set -eu
 umask 077
@@ -14,200 +12,363 @@ err() {
     exit 2
 }
 
-PORTABLE=0
+usage() {
+    cat <<'EOF'
+Uso:
+  bacusp convert [--portable] [--target PLATAFORMA] ORIGEN [DESTINO.bp]
 
-case "${1:-}" in
-    --portable|-portable)
-        PORTABLE=1
-        shift
-        ;;
-esac
+Ejemplos:
+  bacusp convert programa.exe
+  bacusp convert --target linuxarm64 programa
+  bacusp convert --portable carpeta-multiplataforma/ paquete.bp
+EOF
+}
+
+PORTABLE=0
+TARGET=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --portable|-portable)
+            PORTABLE=1
+            shift
+            ;;
+        --target)
+            [ "$#" -ge 2 ] || err "Falta el destino."
+            TARGET=$2
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        -*)
+            err "Opción desconocida: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 SOURCE=${1:-}
-[ -n "$SOURCE" ] || err "Uso: bacusp convert [--portable] ORIGEN [DESTINO.bp]"
-shift || true
+[ -n "$SOURCE" ] || { usage >&2; exit 2; }
+shift
 
 DESTINATION=${1:-}
 shift || true
 [ "$#" -eq 0 ] || err "Demasiados argumentos."
 
-[ -f "$SOURCE" ] || err "El origen no existe o no es un archivo regular."
+[ -e "$SOURCE" ] || err "El origen no existe."
 [ ! -L "$SOURCE" ] || err "No se admiten enlaces simbólicos."
+command -v python3 >/dev/null 2>&1 || err "Se necesita Python 3."
 
-command -v python3 >/dev/null 2>&1 ||
-    err "Se necesita Python 3."
-
-exec python3 - "$SOURCE" "$DESTINATION" "$PORTABLE" <<'PY'
+exec python3 - "$SOURCE" "$DESTINATION" "$PORTABLE" "$TARGET" <<'PY'
 import os
 import sys
 import re
+import stat
 import hashlib
 import struct
 import tempfile
+import shutil
 from pathlib import Path
 
-source_arg, destination_arg, portable_arg = sys.argv[1:]
-source = Path(source_arg).absolute()
-
-if portable_arg not in ("0", "1"):
-    sys.exit("ERROR: opción portable inválida.")
-
-if source.is_symlink() or not source.is_file():
-    sys.exit("ERROR: el origen debe ser un archivo regular.")
-
-portable = portable_arg == "1"
-safe_name = re.sub(
-    r"[^A-Za-z0-9._+-]", "-", source.stem or source.name
-).strip(".-+")
-
-if not safe_name:
-    safe_name = "imported-artifact"
-
-if destination_arg:
-    destination = Path(destination_arg).absolute()
-    if destination.suffix.lower() != ".bp":
-        sys.exit("ERROR: el destino debe terminar en .bp.")
-else:
-    suffix = "-portable.bp" if portable else ".bp"
-    destination = source.with_name(safe_name + suffix)
-
-if destination == source:
-    sys.exit("ERROR: origen y destino no pueden ser el mismo archivo.")
-
-if destination.exists() or destination.is_symlink():
-    sys.exit("ERROR: el destino ya existe; no se sobrescribirá.")
-
-if not destination.parent.is_dir():
-    sys.exit("ERROR: la carpeta de destino no existe.")
+source = Path(sys.argv[1]).absolute()
+destination_arg = sys.argv[2]
+portable = sys.argv[3] == "1"
+requested_target = sys.argv[4].lower()
 
 MAGIC = b"BACUSBP1"
 VERSION = 0x00010000
 HEADER = struct.Struct("<8sIIIQQQ")
 ENTRY = struct.Struct("<IB3sQQQ32s")
+CHUNK = 1024 * 1024
+
+VARIANTS = {
+    "winx64": ("windows", "x86_64"),
+    "winx32": ("windows", "x86"),
+    "winarm64": ("windows", "aarch64"),
+    "winarm": ("windows", "arm"),
+    "linuxx64": ("linux", "x86_64"),
+    "linuxx32": ("linux", "x86"),
+    "linuxarm64": ("linux", "aarch64"),
+    "linuxarm": ("linux", "arm"),
+    "linuxriscv64": ("linux", "riscv64"),
+    "macosx64": ("macos", "x86_64"),
+    "macosarm64": ("macos", "aarch64"),
+    "freebsdx64": ("freebsd", "x86_64"),
+    "freebsdx32": ("freebsd", "x86"),
+    "freebsdarm64": ("freebsd", "aarch64"),
+    "openbsdx64": ("openbsd", "x86_64"),
+    "openbsdarm64": ("openbsd", "aarch64"),
+    "netbsdx64": ("netbsd", "x86_64"),
+    "netbsdx32": ("netbsd", "x86"),
+    "freedosx86": ("freedos", "x86"),
+    "freertos": ("freertos", "any"),
+    "haikux64": ("haiku", "x86_64"),
+    "haikuarm64": ("haiku", "aarch64"),
+    "kolibriosx86": ("kolibrios", "x86"),
+}
+
+def fail(message):
+    raise SystemExit("ERROR: " + message)
+
+def safe_name(value):
+    value = re.sub(r"[^A-Za-z0-9._+-]", "-", value)
+    return value.strip(".-+") or "imported-package"
 
 def encode_value(value):
     allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-/"
-    out = []
+    result = []
     for byte in value.encode("utf-8"):
         if byte in allowed:
-            out.append(chr(byte))
+            result.append(chr(byte))
         else:
-            out.append("%%%02X" % byte)
-    return "".join(out)
+            result.append("%%%02X" % byte)
+    return "".join(result)
 
-digest = hashlib.sha256()
-size = 0
-payload_tmp = None
-output_tmp = None
+def detect_target(path):
+    with path.open("rb") as stream:
+        data = stream.read(4096)
 
-try:
-    payload_tmp = tempfile.TemporaryFile(mode="w+b")
+    # Windows PE executable
+    if data.startswith(b"MZ") and len(data) >= 64:
+        offset = struct.unpack_from("<I", data, 60)[0]
+        if offset + 6 <= len(data) and data[offset:offset+4] == b"PE\0\0":
+            machine = struct.unpack_from("<H", data, offset+4)[0]
+            return {
+                0x8664: "winx64",
+                0x014c: "winx32",
+                0xAA64: "winarm64",
+                0x01c4: "winarm",
+            }.get(machine)
 
-    with source.open("rb") as src:
+    # ELF executable: Linux is the default assumption.
+    if data.startswith(b"\x7fELF") and len(data) >= 20:
+        elf_class = data[4]
+        machine = struct.unpack_from("<H", data, 18)[0]
+        if machine == 3:
+            return "linuxx32" if elf_class == 1 else "linuxx64"
+        if machine == 40:
+            return "linuxarm"
+        if machine == 183:
+            return "linuxarm64"
+        if machine == 243:
+            return "linuxriscv64"
+
+    return None
+
+def collect(root, prefix=""):
+    result = []
+
+    for item in sorted(root.iterdir(), key=lambda p: p.name.encode("utf-8")):
+        if item.is_symlink():
+            fail("No se admiten enlaces simbólicos: " + str(item))
+
+        if item.name in ("", ".", "..") or "\\" in item.name:
+            fail("Nombre de archivo inválido: " + item.name)
+
+        relative = (prefix + "/" + item.name).lstrip("/")
+        mode = item.stat(follow_symlinks=False).st_mode
+
+        if stat.S_ISDIR(mode):
+            result.append((relative, 1, item))
+            result.extend(collect(item, relative))
+        elif stat.S_ISREG(mode):
+            result.append((relative, 0, item))
+        else:
+            fail("Tipo de archivo no admitido: " + str(item))
+
+    return result
+
+if source.is_symlink() or not source.exists():
+    fail("Origen inválido.")
+
+name = safe_name(source.stem if source.is_file() else source.name)
+
+if destination_arg:
+    destination = Path(destination_arg).absolute()
+else:
+    destination = source.with_name(name + ".bp")
+
+if destination.suffix.lower() != ".bp":
+    fail("El destino debe terminar en .bp.")
+if destination == source:
+    fail("Origen y destino no pueden ser iguales.")
+if destination.exists() or destination.is_symlink():
+    fail("El destino ya existe.")
+if not destination.parent.is_dir():
+    fail("La carpeta de destino no existe.")
+
+records = []
+found = []
+
+if source.is_file():
+    if source.suffix.lower() in (".deb", ".rpm", ".msi", ".apk"):
+        fail("Este formato necesita un adaptador específico de extracción.")
+
+    target = requested_target or detect_target(source)
+
+    if target not in VARIANTS:
+        fail("No se pudo detectar la plataforma. Usá --target.")
+
+    found = [target]
+    records.append((target, 1, None))
+    records.append((target + "/" + source.name, 0, source))
+
+elif source.is_dir():
+    if not portable:
+        fail("Para convertir carpetas utilizá --portable.")
+
+    if requested_target:
+        fail("--target se utiliza solamente con archivos individuales.")
+
+    names = {item.name for item in source.iterdir()}
+    unknown = names - set(VARIANTS) - {"shared"}
+
+    if unknown:
+        fail("Carpeta no reconocida: " + ", ".join(sorted(unknown)))
+
+    found = sorted(names & set(VARIANTS))
+
+    if not found:
+        fail("No se encontraron variantes reconocidas.")
+
+    for variant in found:
+        folder = source / variant
+
+        if folder.is_symlink() or not folder.is_dir():
+            fail("Variante inválida: " + variant)
+
+        records.append((variant, 1, None))
+        for path, kind, item in collect(folder):
+            records.append((variant + "/" + path, kind, item))
+
+    if "shared" in names:
+        folder = source / "shared"
+        if folder.is_symlink() or not folder.is_dir():
+            fail("shared debe ser una carpeta real.")
+
+        records.append(("shared", 1, None))
+        records.extend(collect(folder, "shared"))
+
+else:
+    fail("El origen debe ser un archivo o directorio.")
+
+records.sort(key=lambda item: item[0].encode("utf-8"))
+
+seen = set()
+for path, kind, item in records:
+    if path in seen or path.casefold() in {x.casefold() for x in seen}:
+        fail("Ruta duplicada: " + path)
+    seen.add(path)
+
+    if len(path.encode("utf-8")) > 4096:
+        fail("Ruta demasiado larga: " + path)
+
+manifest_fields = [
+    ("package_name", name),
+    ("version", "1.0.0"),
+    ("description", "Multiplatform package created by Bacus-Pkg"),
+    ("target_os", "any"),
+    ("target_arch", "any"),
+    ("payload_format", "raw-v1"),
+    ("entrypoint", ""),
+    ("file_count", str(len(records))),
+    ("variant_layout", "directory-v1"),
+    ("variants", ",".join(found)),
+    ("package_kind", "multiplatform" if portable else "single-variant"),
+]
+
+manifest = "".join(
+    key + "=" + encode_value(value) + "\n"
+    for key, value in manifest_fields
+).encode("utf-8")
+
+table_parts = []
+payload = tempfile.TemporaryFile(mode="w+b")
+payload_offset = 0
+payload_size = 0
+
+for path, kind, item in records:
+    path_bytes = path.encode("utf-8")
+
+    if kind == 1:
+        table_parts.append(
+            ENTRY.pack(len(path_bytes), 1, bytes(3), 0, 0, 0, bytes(32))
+            + path_bytes
+        )
+        continue
+
+    digest = hashlib.sha256()
+    size = 0
+
+    with item.open("rb") as stream:
         while True:
-            block = src.read(1024 * 1024)
+            block = stream.read(CHUNK)
             if not block:
                 break
-            payload_tmp.write(block)
+            payload.write(block)
             digest.update(block)
             size += len(block)
 
-    source_format = source.suffix.lower().lstrip(".") or "unknown"
+    table_parts.append(
+        ENTRY.pack(
+            len(path_bytes), 0, bytes(3),
+            payload_offset, size, size, digest.digest()
+        ) + path_bytes
+    )
 
-    manifest_values = [
-        ("package_name", safe_name),
-        ("version", "1.0.0"),
-        ("description", "File wrapped by Bacus-Pkg"),
-        ("target_os", "unknown"),
-        ("target_arch", "unknown"),
-        ("payload_format", "raw-v1"),
-        ("entrypoint", ""),
-        ("file_count", "1"),
-        ("package_kind", "portable" if portable else "standard"),
-        ("source_format", source_format),
-    ]
+    payload_offset += size
+    payload_size += size
 
-    manifest = "".join(
-        key + "=" + encode_value(value) + "\n"
-        for key, value in manifest_values
-    ).encode("utf-8")
+table = b"".join(table_parts)
+temporary = None
 
-    # El archivo se almacena como una entrada opaca.
-    internal_path = "data/" + source.name
-    path_bytes = internal_path.encode("utf-8")
-
-    if (
-        len(path_bytes) > 4096
-        or any(p in ("", ".", "..") for p in internal_path.split("/"))
-        or "\x00" in internal_path
-        or "\\" in internal_path
-    ):
-        sys.exit("ERROR: ruta interna inválida.")
-
-    # BP v1: 0 = archivo regular; 1 = directorio.
-    table = ENTRY.pack(
-        len(path_bytes),
-        0,
-        b"\x00\x00\x00",
-        0,
-        size,
-        size,
-        digest.digest(),
-    ) + path_bytes
-
+try:
     fd, temp_name = tempfile.mkstemp(
         prefix=".bacusp-",
         suffix=".tmp",
-        dir=str(destination.parent),
+        dir=str(destination.parent)
     )
-    output_tmp = Path(temp_name)
+    temporary = Path(temp_name)
 
-    with os.fdopen(fd, "wb") as out:
-        out.write(HEADER.pack(
-            MAGIC,
-            HEADER.size,
-            VERSION,
-            0,
-            len(manifest),
-            len(table),
-            size,
+    with os.fdopen(fd, "wb") as output:
+        output.write(HEADER.pack(
+            MAGIC, HEADER.size, VERSION, 0,
+            len(manifest), len(table), payload_size
         ))
-        out.write(manifest)
-        out.write(table)
+        output.write(manifest)
+        output.write(table)
 
-        payload_tmp.seek(0)
+        payload.seek(0)
         while True:
-            block = payload_tmp.read(1024 * 1024)
+            block = payload.read(CHUNK)
             if not block:
                 break
-            out.write(block)
+            output.write(block)
 
-        out.flush()
-        os.fsync(out.fileno())
+        output.flush()
+        os.fsync(output.fileno())
 
-    # Publicación sin sobrescribir un destino existente.
-    os.link(output_tmp, destination)
-    output_tmp.unlink()
-    output_tmp = None
+    os.link(temporary, destination)
+    temporary.unlink()
+    temporary = None
 
-    print("Bacus-Pkg: conversión completada.")
-    print("Paquete:", destination)
-    print("Formato de origen:", source_format)
-    print("Tipo:", "portable" if portable else "standard")
-    print("Bytes:", size)
-    print("SHA-256:", digest.hexdigest())
-    print("Aviso: se empaquetó el archivo original; no se transformó su formato.")
+    print("Bacus-Pkg: paquete creado.")
+    print("Archivo:", destination)
+    print("Variantes:", ", ".join(found))
+    print("Entradas:", len(records))
+    print("Payload:", payload_size, "bytes")
+    print("Formato: BP 1.0 + directory-v1")
+    print("Aviso: empaquetar no significa traducir el programa.")
 
-except FileExistsError:
-    sys.exit("ERROR: el destino ya existe.")
-except OSError as exc:
-    sys.exit("ERROR: no se pudo crear el paquete: " + str(exc))
 finally:
-    if payload_tmp is not None:
-        payload_tmp.close()
-    if output_tmp is not None:
+    payload.close()
+    if temporary is not None:
         try:
-            output_tmp.unlink()
+            temporary.unlink()
         except OSError:
             pass
 PY
