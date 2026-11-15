@@ -2,10 +2,8 @@
 #!/bin/sh
 #
 # BACUSP - Universal Package Installer
-# Project: Bacus-Pkg
-# BP v1 + native package adapters
+# BP v1 + multiplatform directory variants
 # POSIX shell / Python 3
-# Languages: Spanish / English
 #
 
 set -eu
@@ -16,13 +14,12 @@ VERIFY="$SCRIPT_DIR/verify.sh"
 
 BACUSP_HOME=${BACUSP_HOME:-"${HOME:-/tmp}/.bacusp"}
 APP_ROOT="$BACUSP_HOME/apps"
-CACHE_ROOT="$BACUSP_HOME/cache"
 
 usage() {
     cat <<'EOF'
-Bacus-Pkg - Instalador universal / Universal installer
+Bacus-Pkg - Instalador universal
 
-Uso / Usage:
+Uso:
   bacusp install ARCHIVO.bp
   bacusp install ARCHIVO.deb
   bacusp install ARCHIVO.rpm
@@ -30,8 +27,8 @@ Uso / Usage:
   bacusp install ARCHIVO.pkg.tar.zst
   bacusp install NOMBRE
 
-Los nombres requieren un gestor de paquetes compatible.
-Package names require a compatible package manager.
+Los paquetes BP multiplataforma instalan solamente la variante
+compatible con el sistema y la arquitectura actuales.
 EOF
 }
 
@@ -48,33 +45,48 @@ INPUT=$1
 
 case "$INPUT" in
     ""|-*)
-        error "nombre o ruta inválidos / invalid name or path"
+        error "nombre o ruta inválidos"
         exit 2
         ;;
 esac
 
-if ! command -v python3 >/dev/null 2>&1; then
-    error "se necesita Python 3 / Python 3 is required"
-    exit 1
-fi
+is_root() {
+    [ "$(id -u)" -eq 0 ]
+}
+
+run_native() {
+    if is_root; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        error "se necesitan permisos de administrador"
+        exit 1
+    fi
+}
 
 # --------------------------------------------------
-# 1. Install BP v1 packages
+# 1. BP package installation
 # --------------------------------------------------
 
 case "$INPUT" in
     *.bp)
-        if [ ! -f "$INPUT" ] || [ -L "$INPUT" ]; then
-            error "se requiere un archivo .bp regular, no un enlace"
+        [ -f "$INPUT" ] && [ ! -L "$INPUT" ] || {
+            error "se requiere un archivo BP regular"
             exit 1
-        fi
+        }
 
-        if [ ! -f "$VERIFY" ]; then
+        [ -f "$VERIFY" ] || {
             error "falta modules/verify.sh"
             exit 1
-        fi
+        }
 
-        # Verify the package before extracting anything.
+        command -v python3 >/dev/null 2>&1 || {
+            error "se necesita Python 3"
+            exit 1
+        }
+
+        # Verify before extracting.
         if ! sh "$VERIFY" "$INPUT"; then
             error "el paquete BP no pasó la verificación"
             exit 1
@@ -159,14 +171,13 @@ def parse_manifest(data):
         if key in result:
             fail("clave duplicada: " + key)
 
+        if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+            fail("escape porcentual inválido")
+
         try:
             decoded = unquote_to_bytes(value).decode("utf-8")
         except (UnicodeDecodeError, ValueError):
             fail("valor de manifiesto inválido")
-
-        # Reject malformed percent escapes.
-        if re.search(r"%(?![0-9A-Fa-f]{2})", value):
-            fail("escape porcentual inválido")
 
         result[key] = decoded
 
@@ -211,7 +222,7 @@ def check_target(manifest):
         current_os.startswith("linux")
         and os.path.exists("/etc/debian_version")
     ):
-        fail("este paquete requiere Debian o un sistema derivado compatible")
+        fail("este paquete requiere Debian o derivado compatible")
 
     aliases = {
         "any": ("any",),
@@ -236,9 +247,81 @@ def check_target(manifest):
         if machine not in compatible:
             fail(
                 "arquitectura incompatible: paquete "
-                + target_arch + ", sistema "
-                + (machine or "desconocido")
+                + target_arch + ", sistema " + (machine or "desconocido")
             )
+
+def get_variant():
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    os_aliases = {
+        "windows": "win",
+        "linux": "linux",
+        "darwin": "macos",
+        "freebsd": "freebsd",
+        "openbsd": "openbsd",
+        "netbsd": "netbsd",
+        "haiku": "haiku",
+    }
+
+    arch_aliases = {
+        "x86_64": "x64",
+        "amd64": "x64",
+        "i386": "x32",
+        "i486": "x32",
+        "i586": "x32",
+        "i686": "x32",
+        "x86": "x32",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "armv7l": "arm",
+        "armv6l": "arm",
+        "arm": "arm",
+        "riscv64": "riscv64",
+    }
+
+    os_name = os_aliases.get(system)
+    arch_name = arch_aliases.get(machine)
+
+    if not os_name or not arch_name:
+        fail("no se pudo identificar el sistema y la arquitectura")
+
+    return os_name + arch_name
+
+def select_variant(manifest, records):
+    variants = {
+        item for item in manifest.get("variants", "").split(",")
+        if item
+    }
+
+    if not variants:
+        # Legacy BP 1.0 package: keep its original layout.
+        return records
+
+    selected = get_variant()
+
+    if selected not in variants:
+        fail("el paquete no contiene la variante compatible: " + selected)
+
+    filtered = []
+
+    for path, kind, offset, stored, digest in records:
+        first, separator, remainder = path.partition("/")
+
+        if first == selected and separator:
+            filtered.append(
+                (remainder, kind, offset, stored, digest)
+            )
+        elif first == "shared" and separator:
+            filtered.append(
+                (path, kind, offset, stored, digest)
+            )
+
+    if not filtered:
+        fail("la variante seleccionada no contiene archivos")
+
+    print("Variante seleccionada:", selected)
+    return filtered
 
 def main():
     package = os.path.abspath(sys.argv[1])
@@ -252,6 +335,7 @@ def main():
     try:
         with open(package, "rb") as stream:
             header = exact(stream, HEADER.size)
+
             magic, hsize, fmt, flags, msize, tsize, psize = HEADER.unpack(header)
 
             if magic != MAGIC or hsize != HEADER.size:
@@ -265,8 +349,7 @@ def main():
             if HEADER.size + msize + tsize + psize != total:
                 fail("tamaños de sección incorrectos")
 
-            max_manifest = 16 * 1024 * 1024
-            if msize > max_manifest:
+            if msize > 16 * 1024 * 1024:
                 fail("manifiesto demasiado grande")
 
             manifest, count = parse_manifest(exact(stream, msize))
@@ -287,11 +370,8 @@ def main():
             next_offset = 0
             seen = set()
 
-            # Bound the number of records by the table's actual size.
             if count > tsize // (ENTRY.size + 1):
                 fail("cantidad de entradas inválida")
-
-            stage = tempfile.mkdtemp(prefix=".bp-stage-", dir=app_root)
 
             for _ in range(count):
                 raw_entry = exact(stream, ENTRY.size)
@@ -335,7 +415,10 @@ def main():
             if table_used != tsize or next_offset != psize:
                 fail("tabla o payload inconsistente")
 
-            # Reject file/directory path conflicts before extraction.
+            # Select platform-specific files before extraction.
+            records = select_variant(manifest, records)
+
+            # Reject file/directory conflicts.
             kinds = {path: kind for path, kind, *_ in records}
 
             for path, kind, *_ in records:
@@ -346,15 +429,20 @@ def main():
                         fail("un archivo no puede ser directorio padre: " + parent)
 
             entrypoint = manifest["entrypoint"]
+
             if entrypoint:
                 safe_path(entrypoint.encode("utf-8"))
                 if kinds.get(entrypoint) != 0:
-                    fail("entrypoint no apunta a un archivo del paquete")
+                    fail("entrypoint no apunta a un archivo")
 
             payload_start = HEADER.size + msize + tsize
 
+            stage = tempfile.mkdtemp(prefix=".bp-stage-", dir=app_root)
+
             for path, kind, offset, stored, expected_digest in records:
-                target = os.path.abspath(os.path.join(stage, *path.split("/")))
+                target = os.path.abspath(
+                    os.path.join(stage, *path.split("/"))
+                )
 
                 if os.path.commonpath((stage, target)) != stage:
                     fail("ruta fuera del directorio temporal")
@@ -388,12 +476,12 @@ def main():
             os.rename(stage, destination)
             stage = None
 
-            print("Instalación BP completada / BP installation completed.")
-            print("Paquete / Package:", name)
-            print("Versión / Version:", version)
-            print("Entradas / Entries:", count)
-            print("Directorio / Directory:", destination)
-            print("Aviso: la integridad no garantiza que el contenido sea inocuo.")
+            print("Instalación BP completada.")
+            print("Paquete:", name)
+            print("Versión:", version)
+            print("Entradas instaladas:", len(records))
+            print("Directorio:", destination)
+            print("Aviso: SHA-256 verifica integridad, no autenticidad.")
 
     finally:
         if stage and os.path.isdir(stage):
@@ -405,27 +493,12 @@ except (OSError, OverflowError, struct.error, ValueError) as exc:
     fail(str(exc))
 PY
         ;;
+
 esac
 
 # --------------------------------------------------
 # 2. Native package installation
-# These formats may modify the operating system.
 # --------------------------------------------------
-
-is_root() {
-    [ "$(id -u)" -eq 0 ]
-}
-
-run_native() {
-    if is_root; then
-        "$@"
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
-    else
-        error "se necesitan permisos de administrador / administrator permissions required"
-        exit 1
-    fi
-}
 
 case "$INPUT" in
     *.deb)
@@ -434,20 +507,13 @@ case "$INPUT" in
             exit 1
         }
 
-        printf '%s\n' "Se instalará un paquete nativo del sistema."
-        printf '%s\n' "A native system package will be installed."
-        printf '¿Continuar? Escribí SI / Continue? Type YES: '
+        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
         IFS= read -r ANSWER || exit 2
-
-        case "$ANSWER" in
-            SI|YES) ;;
-            *) echo "Cancelado / Cancelled."; exit 0 ;;
-        esac
+        case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
 
         if command -v apt-get >/dev/null 2>&1; then
             run_native apt-get install -y "./$INPUT"
         elif command -v dpkg >/dev/null 2>&1; then
-            echo "Aviso: dpkg no resuelve automáticamente todas las dependencias."
             run_native dpkg -i "$INPUT"
         else
             error "se necesita apt-get o dpkg"
@@ -462,8 +528,7 @@ case "$INPUT" in
             exit 1
         }
 
-        printf '%s\n' "Se instalará un paquete nativo del sistema."
-        printf '¿Continuar? Escribí SI / Continue? Type YES: '
+        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
         IFS= read -r ANSWER || exit 2
         case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
 
@@ -486,15 +551,15 @@ case "$INPUT" in
             exit 1
         }
 
-        printf '%s\n' "Se instalará un paquete nativo del sistema."
-        printf '¿Continuar? Escribí SI / Continue? Type YES: '
+        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
         IFS= read -r ANSWER || exit 2
         case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
 
         command -v apk >/dev/null 2>&1 || {
-            error "no se encontró el gestor apk de Alpine Linux"
+            error "se necesita apk"
             exit 1
         }
+
         run_native apk add -- "$INPUT"
         exit 0
         ;;
@@ -505,8 +570,7 @@ case "$INPUT" in
             exit 1
         }
 
-        printf '%s\n' "Se instalará un paquete nativo del sistema."
-        printf '¿Continuar? Escribí SI / Continue? Type YES: '
+        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
         IFS= read -r ANSWER || exit 2
         case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
 
@@ -514,6 +578,7 @@ case "$INPUT" in
             error "se necesita pacman"
             exit 1
         }
+
         run_native pacman -U -- "$INPUT"
         exit 0
         ;;
@@ -602,6 +667,5 @@ fi
 
 error "no se detectó un gestor de paquetes compatible"
 printf '%s\n' \
-    "Bacus-Pkg puede instalar paquetes BP, pero este sistema" \
-    "necesita un adaptador nativo específico."
+    "Bacus-Pkg necesita un adaptador específico para este sistema."
 exit 3
