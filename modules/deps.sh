@@ -1,20 +1,26 @@
 
+```sh
 #!/bin/sh
 # ============================================================
-# BACUSP 7.6 - Independent Dependency Resolution Engine
-# ============================================================
-# Native package managers: NOT USED.
+# BACUSP 7.8 - Independent Dependency Resolution Engine
+# Project: Bacus-Pkg
 #
 # Features:
 # - Direct and transitive dependency resolution
 # - Version constraints
 # - Backtracking candidate selection
 # - Architecture and OS compatibility
+# - Repository priority:
+#     0. Official
+#     1. Community
+#     2. External distributions
 # - Shared dependency handling
 # - Circular dependency detection
 # - Topological installation plan
 #
-# Index format: 8 tab-separated fields:
+# Native package managers are never executed.
+#
+# Current index format:
 # name version architecture os sha256 filename url dependencies
 # ============================================================
 
@@ -26,7 +32,7 @@ INDEX_DIR="$BACUSP_HOME/repositories"
 
 usage() {
     cat <<'EOF'
-BACUSP Dependency Engine
+BACUSP 7.8 - Dependency Engine
 
 Usage:
   bacusp deps resolve PACKAGE
@@ -44,15 +50,21 @@ Dependency syntax:
   libfoo>1.0.0
   libfoo<3.0.0
 
-Index format:
-  name<TAB>version<TAB>architecture<TAB>os<TAB>sha256<TAB>filename<TAB>url<TAB>dependencies
-
 Multiple dependencies:
   libfoo>=1.0.0,libbar>=2.0.0
 
+Repository priority:
+  0 = official
+  1 = community
+  2 = external
+  3 = legacy/unknown (treated as community)
+
+Index format:
+  name<TAB>version<TAB>architecture<TAB>os<TAB>sha256<TAB>filename<TAB>url<TAB>dependencies
+
 Output:
-  Topologically ordered TSV installation plan.
-  Dependencies are listed before the requested package.
+  resolve: topologically ordered TSV installation plan.
+  check: human-readable dependency tree.
 EOF
 }
 
@@ -103,11 +115,16 @@ ROOT_PACKAGE = sys.argv[2]
 ACTION = sys.argv[3]
 
 MAX_PACKAGES = 10000
-MAX_DEPTH = 500
+MAX_DEPTH = 200
+MAX_SEARCH_STEPS = 100000
+
+search_steps = 0
+
 
 def fail(message):
     print("BACUSP deps: " + message, file=sys.stderr)
     raise SystemExit(1)
+
 
 # ------------------------------------------------------------
 # Version handling
@@ -117,17 +134,19 @@ VERSION_PATTERN = re.compile(
     r"^([0-9]+(?:\.[0-9]+)*)(?:-([A-Za-z0-9.-]+))?(?:\+([A-Za-z0-9.-]+))?$"
 )
 
+
 def version_parts(version):
     match = VERSION_PATTERN.fullmatch(version)
 
     if not match:
-        fail("versión inválida: " + version)
+        fail("versión no compatible con el formato actual: " + version)
 
     numbers = tuple(int(x) for x in match.group(1).split("."))
     prerelease = match.group(2)
     build = match.group(3)
 
     return numbers, prerelease, build
+
 
 def compare_versions(left, right):
     left_numbers, left_pre, _ = version_parts(left)
@@ -141,7 +160,6 @@ def compare_versions(left, right):
     if a != b:
         return (a > b) - (a < b)
 
-    # A stable release is newer than its prerelease.
     if left_pre is None and right_pre is not None:
         return 1
 
@@ -152,6 +170,7 @@ def compare_versions(left, right):
         return (left_pre > right_pre) - (left_pre < right_pre)
 
     return 0
+
 
 def satisfies(version, constraints):
     for operator, required in constraints:
@@ -174,6 +193,7 @@ def satisfies(version, constraints):
 
     return True
 
+
 # ------------------------------------------------------------
 # Dependency syntax
 # ------------------------------------------------------------
@@ -181,6 +201,7 @@ def satisfies(version, constraints):
 DEPENDENCY_PATTERN = re.compile(
     r"^([A-Za-z0-9._+-]+)(?:(>=|<=|=|>|<)([A-Za-z0-9.+-]+))?$"
 )
+
 
 def parse_dependency(raw):
     raw = raw.strip()
@@ -197,6 +218,7 @@ def parse_dependency(raw):
 
     return name, operator, version
 
+
 def parse_dependencies(value):
     if value in ("", "-"):
         return []
@@ -204,12 +226,33 @@ def parse_dependencies(value):
     result = []
 
     for item in value.split(","):
-        if not item:
+        if not item.strip():
             fail("dependencia vacía en un índice")
 
         result.append(parse_dependency(item))
 
     return result
+
+
+# ------------------------------------------------------------
+# Repository priority
+# ------------------------------------------------------------
+
+def repository_priority(index_path):
+    filename = os.path.basename(index_path).lower()
+
+    if filename.startswith("official-"):
+        return 0
+
+    if filename.startswith("community-"):
+        return 1
+
+    if filename.startswith("external-"):
+        return 2
+
+    # Legacy index files remain usable.
+    return 1
+
 
 # ------------------------------------------------------------
 # Platform compatibility
@@ -220,22 +263,45 @@ def compatible_architecture(package_arch):
     package_arch = package_arch.lower()
 
     aliases = {
-        "x86_64": {"x86_64", "amd64", "any"},
-        "amd64": {"x86_64", "amd64", "any"},
-        "i386": {"i386", "i486", "i586", "i686", "x86", "any"},
-        "i486": {"i386", "i486", "i586", "i686", "x86", "any"},
-        "i586": {"i386", "i486", "i586", "i686", "x86", "any"},
-        "i686": {"i386", "i486", "i586", "i686", "x86", "any"},
-        "aarch64": {"aarch64", "arm64", "any"},
-        "arm64": {"aarch64", "arm64", "any"},
-        "armv7l": {"arm", "armhf", "armv7l", "any"},
-        "armv6l": {"arm", "armv6", "any"},
-        "riscv64": {"riscv64", "any"},
+        "x86_64": {
+            "x86_64", "amd64", "any"
+        },
+        "amd64": {
+            "x86_64", "amd64", "any"
+        },
+        "i386": {
+            "i386", "i486", "i586", "i686", "x86", "any"
+        },
+        "i486": {
+            "i386", "i486", "i586", "i686", "x86", "any"
+        },
+        "i586": {
+            "i386", "i486", "i586", "i686", "x86", "any"
+        },
+        "i686": {
+            "i386", "i486", "i586", "i686", "x86", "any"
+        },
+        "aarch64": {
+            "aarch64", "arm64", "any"
+        },
+        "arm64": {
+            "aarch64", "arm64", "any"
+        },
+        "armv7l": {
+            "arm", "armhf", "armv7l", "any"
+        },
+        "armv6l": {
+            "arm", "armv6", "any"
+        },
+        "riscv64": {
+            "riscv64", "any"
+        },
     }
 
     accepted = aliases.get(machine, {machine, "any"})
 
     return package_arch in accepted
+
 
 def compatible_os(package_os):
     system = platform.system().lower()
@@ -264,18 +330,22 @@ def compatible_os(package_os):
 
     return package_os == system
 
+
 # ------------------------------------------------------------
-# Index loading
+# Index validation and loading
 # ------------------------------------------------------------
 
 def load_indexes():
     packages = {}
+
     index_files = sorted(
         glob.glob(os.path.join(INDEX_DIR, "*.tsv"))
     )
 
     if not index_files:
         fail("no se encontraron índices sincronizados")
+
+    total_packages = 0
 
     for index_path in index_files:
         if os.path.islink(index_path):
@@ -284,12 +354,16 @@ def load_indexes():
         if not os.path.isfile(index_path):
             continue
 
+        tier = repository_priority(index_path)
+        index_name = os.path.basename(index_path)
+
         try:
             with open(
                 index_path,
                 "r",
                 encoding="utf-8"
             ) as stream:
+
                 for line_number, line in enumerate(stream, 1):
                     line = line.rstrip("\r\n")
 
@@ -300,8 +374,10 @@ def load_indexes():
 
                     if len(fields) != 8:
                         fail(
-                            f"índice inválido: "
-                            f"{index_path}:{line_number}"
+                            "índice inválido: "
+                            + index_path
+                            + ":"
+                            + str(line_number)
                         )
 
                     (
@@ -348,6 +424,9 @@ def load_indexes():
                     if not url.startswith("https://"):
                         fail("URL HTTPS obligatoria: " + name)
 
+                    if any(char in url for char in "\r\n\t"):
+                        fail("URL inválida: " + name)
+
                     version_parts(version)
 
                     dependencies = parse_dependencies(
@@ -369,20 +448,33 @@ def load_indexes():
                         "filename": filename,
                         "url": url,
                         "dependencies": dependencies,
+                        "tier": tier,
+                        "repository": index_name,
                     }
 
                     packages.setdefault(name, []).append(package)
 
-                    if sum(len(v) for v in packages.values()) > MAX_PACKAGES:
-                        fail("se superó el límite de paquetes del resolvedor")
+                    total_packages += 1
+
+                    if total_packages > MAX_PACKAGES:
+                        fail(
+                            "se superó el límite de "
+                            + str(MAX_PACKAGES)
+                            + " paquetes"
+                        )
 
         except UnicodeError:
             fail("índice con codificación inválida: " + index_path)
 
         except OSError as exc:
-            fail("no se pudo leer " + index_path + ": " + str(exc))
+            fail(
+                "no se pudo leer "
+                + index_path
+                + ": "
+                + str(exc)
+            )
 
-    # Remove identical duplicate candidates.
+    # Deduplicate identical packages without losing source priority.
     for name, candidates in packages.items():
         unique = {}
 
@@ -390,21 +482,30 @@ def load_indexes():
             key = (
                 candidate["version"],
                 candidate["sha256"],
-                candidate["url"]
+                candidate["url"],
+                candidate["tier"]
             )
 
             unique[key] = candidate
 
         packages[name] = list(unique.values())
 
+        # Stable ordering:
+        # First version, then repository priority.
         packages[name].sort(
             key=lambda item: version_parts(item["version"]),
             reverse=True
         )
 
+        packages[name].sort(
+            key=lambda item: item["tier"]
+        )
+
     return packages
 
+
 PACKAGES = load_indexes()
+
 
 # ------------------------------------------------------------
 # Candidate selection
@@ -417,10 +518,22 @@ def candidates_for(name, constraints):
         if satisfies(candidate["version"], constraints):
             result.append(candidate)
 
+    # Official repositories always have priority over community.
+    # Community always has priority over external distributions.
+    result.sort(
+        key=lambda item: version_parts(item["version"]),
+        reverse=True
+    )
+
+    result.sort(
+        key=lambda item: item["tier"]
+    )
+
     return result
 
+
 # ------------------------------------------------------------
-# Dependency graph cycle detection
+# Dependency graph
 # ------------------------------------------------------------
 
 def topological_order(selected, root):
@@ -463,15 +576,23 @@ def topological_order(selected, root):
 
     return order
 
+
 # ------------------------------------------------------------
 # Independent backtracking resolver
 # ------------------------------------------------------------
 
 def resolve(constraints, selected, depth=0):
+    global search_steps
+
+    search_steps += 1
+
+    if search_steps > MAX_SEARCH_STEPS:
+        fail("se superó el límite de búsqueda del resolvedor")
+
     if depth > MAX_DEPTH:
         return None
 
-    # Validate constraints against packages already selected.
+    # Validate all constraints against selected packages.
     for name, requirements in constraints.items():
         if name in selected:
             if not satisfies(
@@ -485,7 +606,7 @@ def resolve(constraints, selected, depth=0):
         if name not in selected
     ]
 
-    # Every package has a selected candidate.
+    # All dependencies have a selected candidate.
     if not unresolved:
         return selected
 
@@ -506,7 +627,7 @@ def resolve(constraints, selected, depth=0):
             candidates
         ))
 
-    # Choose the package with the fewest available candidates.
+    # Resolve the package with the fewest candidates first.
     _, name, candidates = min(
         choices,
         key=lambda item: item[0]
@@ -523,7 +644,7 @@ def resolve(constraints, selected, depth=0):
 
         invalid = False
 
-        # Expand dependencies immediately.
+        # Expand direct and transitive dependencies.
         for dep_name, operator, dep_version in candidate["dependencies"]:
             next_constraints.setdefault(dep_name, [])
 
@@ -552,7 +673,7 @@ def resolve(constraints, selected, depth=0):
         if result is None:
             continue
 
-        # Reject cyclic graphs and try another candidate.
+        # Reject circular dependency graphs.
         if topological_order(result, ROOT_PACKAGE) is None:
             continue
 
@@ -560,12 +681,16 @@ def resolve(constraints, selected, depth=0):
 
     return None
 
+
 # ------------------------------------------------------------
 # Resolve requested package
 # ------------------------------------------------------------
 
 if ROOT_PACKAGE not in PACKAGES:
-    fail("paquete no encontrado o incompatible: " + ROOT_PACKAGE)
+    fail(
+        "paquete no encontrado o incompatible: "
+        + ROOT_PACKAGE
+    )
 
 print(
     "BACUSP deps: resolviendo " + ROOT_PACKAGE,
@@ -583,10 +708,14 @@ if selected is None:
         "Revisá dependencias, versiones y ciclos."
     )
 
-order = topological_order(selected, ROOT_PACKAGE)
+order = topological_order(
+    selected,
+    ROOT_PACKAGE
+)
 
 if order is None:
     fail("se detectó un ciclo de dependencias")
+
 
 # ------------------------------------------------------------
 # Human-readable check mode
@@ -594,18 +723,34 @@ if order is None:
 
 if ACTION == "check":
     print("Árbol de dependencias válido:")
+    print("")
 
     for name in order:
         package = selected[name]
+
+        tiers = {
+            0: "oficial",
+            1: "comunidad",
+            2: "externo",
+            3: "desconocido"
+        }
 
         print(
             "  "
             + package["name"]
             + " "
             + package["version"]
+            + " ["
+            + tiers[package["tier"]]
+            + "]"
         )
 
+    print("")
+    print("Paquetes:", len(order))
+    print("Pasos de resolución:", search_steps)
+
     raise SystemExit(0)
+
 
 # ------------------------------------------------------------
 # Machine-readable installation plan
@@ -632,3 +777,4 @@ for name in order:
     print("\t".join(fields))
 
 PY
+```
