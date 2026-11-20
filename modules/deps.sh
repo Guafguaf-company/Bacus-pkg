@@ -1,8 +1,22 @@
 
 #!/bin/sh
-# BACUSP 7.6 - Independent Dependency Resolver
-# Resolves packages from BACUSP repository indexes.
-# Never invokes native package managers.
+# ============================================================
+# BACUSP 7.6 - Independent Dependency Resolution Engine
+# ============================================================
+# Native package managers: NOT USED.
+#
+# Features:
+# - Direct and transitive dependency resolution
+# - Version constraints
+# - Backtracking candidate selection
+# - Architecture and OS compatibility
+# - Shared dependency handling
+# - Circular dependency detection
+# - Topological installation plan
+#
+# Index format: 8 tab-separated fields:
+# name version architecture os sha256 filename url dependencies
+# ============================================================
 
 set -eu
 umask 077
@@ -12,20 +26,33 @@ INDEX_DIR="$BACUSP_HOME/repositories"
 
 usage() {
     cat <<'EOF'
-BACUSP Dependency Resolver
+BACUSP Dependency Engine
 
 Usage:
   bacusp deps resolve PACKAGE
+  bacusp deps check PACKAGE
 
-Output:
-  A topologically ordered installation plan.
-  Dependencies appear before the requested package.
+Examples:
+  bacusp deps resolve btop
+  bacusp deps check firefox
 
-Supported constraints:
+Dependency syntax:
   libfoo
   libfoo>=1.2.0
-  libfoo=2.0.0
+  libfoo<=2.0.0
+  libfoo=1.5.0
+  libfoo>1.0.0
   libfoo<3.0.0
+
+Index format:
+  name<TAB>version<TAB>architecture<TAB>os<TAB>sha256<TAB>filename<TAB>url<TAB>dependencies
+
+Multiple dependencies:
+  libfoo>=1.0.0,libbar>=2.0.0
+
+Output:
+  Topologically ordered TSV installation plan.
+  Dependencies are listed before the requested package.
 EOF
 }
 
@@ -33,11 +60,7 @@ ACTION=${1:-}
 PACKAGE=${2:-}
 
 case "$ACTION" in
-    resolve)
-        [ -n "$PACKAGE" ] || {
-            echo "Error: falta el paquete." >&2
-            exit 2
-        }
+    resolve|check)
         ;;
     *)
         usage >&2
@@ -45,77 +68,90 @@ case "$ACTION" in
         ;;
 esac
 
+if [ -z "$PACKAGE" ]; then
+    echo "BACUSP deps: falta el nombre del paquete." >&2
+    exit 2
+fi
+
 case "$PACKAGE" in
-    *[!A-Za-z0-9._+-]*|"")
-        echo "Error: nombre de paquete inválido." >&2
+    *[!A-Za-z0-9._+-]*)
+        echo "BACUSP deps: nombre de paquete inválido." >&2
         exit 2
         ;;
 esac
 
-[ -d "$INDEX_DIR" ] || {
-    echo "Error: no hay índices de repositorios. Ejecutá bacusp repo sync." >&2
+if [ ! -d "$INDEX_DIR" ]; then
+    echo "BACUSP deps: no existen índices de repositorios." >&2
+    echo "Ejecutá primero: bacusp repo sync" >&2
     exit 1
-}
+fi
 
-command -v python3 >/dev/null 2>&1 || {
-    echo "Error: se necesita Python 3." >&2
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "BACUSP deps: Python 3 es obligatorio." >&2
     exit 1
-}
+fi
 
-exec python3 - "$INDEX_DIR" "$PACKAGE" <<'PY'
+exec python3 - "$INDEX_DIR" "$PACKAGE" "$ACTION" <<'PY'
 import sys
 import os
 import re
 import glob
 import platform
 
-index_dir, root_package = sys.argv[1:3]
+INDEX_DIR = sys.argv[1]
+ROOT_PACKAGE = sys.argv[2]
+ACTION = sys.argv[3]
+
+MAX_PACKAGES = 10000
+MAX_DEPTH = 500
 
 def fail(message):
     print("BACUSP deps: " + message, file=sys.stderr)
     raise SystemExit(1)
 
-def version_key(value):
-    # Numeric dot-separated versions, with a lexical suffix.
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)(?:[-+]([A-Za-z0-9.-]+))?", value)
+# ------------------------------------------------------------
+# Version handling
+# ------------------------------------------------------------
+
+VERSION_PATTERN = re.compile(
+    r"^([0-9]+(?:\.[0-9]+)*)(?:-([A-Za-z0-9.-]+))?(?:\+([A-Za-z0-9.-]+))?$"
+)
+
+def version_parts(version):
+    match = VERSION_PATTERN.fullmatch(version)
+
     if not match:
-        fail("versión no válida en un índice: " + value)
+        fail("versión inválida: " + version)
 
-    numbers = tuple(int(part) for part in match.group(1).split("."))
-    suffix = match.group(2)
+    numbers = tuple(int(x) for x in match.group(1).split("."))
+    prerelease = match.group(2)
+    build = match.group(3)
 
-    return numbers, suffix is None, suffix or ""
+    return numbers, prerelease, build
 
 def compare_versions(left, right):
-    a, b = version_key(left), version_key(right)
+    left_numbers, left_pre, _ = version_parts(left)
+    right_numbers, right_pre, _ = version_parts(right)
 
-    max_length = max(len(a[0]), len(b[0]))
-    av = a[0] + (0,) * (max_length - len(a[0]))
-    bv = b[0] + (0,) * (max_length - len(b[0]))
+    length = max(len(left_numbers), len(right_numbers))
 
-    if av != bv:
-        return (av > bv) - (av < bv)
+    a = left_numbers + (0,) * (length - len(left_numbers))
+    b = right_numbers + (0,) * (length - len(right_numbers))
 
-    if a[1] != b[1]:
-        return (a[1] > b[1]) - (a[1] < b[1])
+    if a != b:
+        return (a > b) - (a < b)
 
-    return (a[2] > b[2]) - (a[2] < b[2])
+    # A stable release is newer than its prerelease.
+    if left_pre is None and right_pre is not None:
+        return 1
 
-def parse_dependency(raw):
-    match = re.fullmatch(
-        r"([A-Za-z0-9._+-]+)(?:(>=|<=|=|>|<)([A-Za-z0-9.+-]+))?",
-        raw.strip()
-    )
+    if left_pre is not None and right_pre is None:
+        return -1
 
-    if not match:
-        fail("dependencia mal formada: " + raw)
+    if left_pre != right_pre:
+        return (left_pre > right_pre) - (left_pre < right_pre)
 
-    name, operator, version = match.groups()
-
-    if version:
-        version_key(version)
-
-    return name, operator, version
+    return 0
 
 def satisfies(version, constraints):
     for operator, required in constraints:
@@ -123,24 +159,72 @@ def satisfies(version, constraints):
 
         if operator == ">=" and result < 0:
             return False
+
         if operator == "<=" and result > 0:
             return False
+
         if operator == ">" and result <= 0:
             return False
+
         if operator == "<" and result >= 0:
             return False
+
         if operator == "=" and result != 0:
             return False
 
     return True
 
-def compatible_arch(arch):
+# ------------------------------------------------------------
+# Dependency syntax
+# ------------------------------------------------------------
+
+DEPENDENCY_PATTERN = re.compile(
+    r"^([A-Za-z0-9._+-]+)(?:(>=|<=|=|>|<)([A-Za-z0-9.+-]+))?$"
+)
+
+def parse_dependency(raw):
+    raw = raw.strip()
+
+    match = DEPENDENCY_PATTERN.fullmatch(raw)
+
+    if not match:
+        fail("dependencia mal formada: " + raw)
+
+    name, operator, version = match.groups()
+
+    if version is not None:
+        version_parts(version)
+
+    return name, operator, version
+
+def parse_dependencies(value):
+    if value in ("", "-"):
+        return []
+
+    result = []
+
+    for item in value.split(","):
+        if not item:
+            fail("dependencia vacía en un índice")
+
+        result.append(parse_dependency(item))
+
+    return result
+
+# ------------------------------------------------------------
+# Platform compatibility
+# ------------------------------------------------------------
+
+def compatible_architecture(package_arch):
     machine = platform.machine().lower()
+    package_arch = package_arch.lower()
 
     aliases = {
         "x86_64": {"x86_64", "amd64", "any"},
         "amd64": {"x86_64", "amd64", "any"},
         "i386": {"i386", "i486", "i586", "i686", "x86", "any"},
+        "i486": {"i386", "i486", "i586", "i686", "x86", "any"},
+        "i586": {"i386", "i486", "i586", "i686", "x86", "any"},
         "i686": {"i386", "i486", "i586", "i686", "x86", "any"},
         "aarch64": {"aarch64", "arm64", "any"},
         "arm64": {"aarch64", "arm64", "any"},
@@ -150,209 +234,401 @@ def compatible_arch(arch):
     }
 
     accepted = aliases.get(machine, {machine, "any"})
-    return arch.lower() in accepted
 
-def compatible_os(target):
+    return package_arch in accepted
+
+def compatible_os(package_os):
     system = platform.system().lower()
-    target = target.lower()
+    package_os = package_os.lower()
 
-    if target == "any":
+    if package_os == "any":
         return True
-    if target == "unix":
-        return system in ("linux", "darwin", "freebsd", "openbsd", "netbsd")
-    if target == "linux":
-        return system == "linux"
-    if target == "macos":
-        return system == "darwin"
-    if target == "freebsd":
-        return system == "freebsd"
 
-    return target == system
+    if package_os == "unix":
+        return system in (
+            "linux",
+            "darwin",
+            "freebsd",
+            "openbsd",
+            "netbsd"
+        )
+
+    if package_os == "linux":
+        return system == "linux"
+
+    if package_os in ("macos", "mac"):
+        return system == "darwin"
+
+    if package_os == "windows":
+        return system == "windows"
+
+    return package_os == system
+
+# ------------------------------------------------------------
+# Index loading
+# ------------------------------------------------------------
 
 def load_indexes():
     packages = {}
+    index_files = sorted(
+        glob.glob(os.path.join(INDEX_DIR, "*.tsv"))
+    )
 
-    for path in sorted(glob.glob(os.path.join(index_dir, "*.tsv"))):
-        if not os.path.isfile(path) or os.path.islink(path):
+    if not index_files:
+        fail("no se encontraron índices sincronizados")
+
+    for index_path in index_files:
+        if os.path.islink(index_path):
             continue
 
-        with open(path, "r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, 1):
-                line = line.rstrip("\n")
+        if not os.path.isfile(index_path):
+            continue
 
-                if not line:
-                    continue
+        try:
+            with open(
+                index_path,
+                "r",
+                encoding="utf-8"
+            ) as stream:
+                for line_number, line in enumerate(stream, 1):
+                    line = line.rstrip("\r\n")
 
-                fields = line.split("\t")
+                    if not line:
+                        continue
 
-                if len(fields) != 8:
-                    fail(f"índice inválido: {path}:{line_number}")
+                    fields = line.split("\t")
 
-                name, version, arch, os_name, digest, filename, url, depends = fields
+                    if len(fields) != 8:
+                        fail(
+                            f"índice inválido: "
+                            f"{index_path}:{line_number}"
+                        )
 
-                if not re.fullmatch(r"[A-Za-z0-9._+-]+", name):
-                    fail("nombre inválido en índice: " + name)
+                    (
+                        name,
+                        version,
+                        architecture,
+                        os_name,
+                        digest,
+                        filename,
+                        url,
+                        dependency_text
+                    ) = fields
 
-                if not re.fullmatch(r"[A-Za-z0-9._+-]+", filename):
-                    fail("nombre de archivo inválido: " + filename)
+                    if not re.fullmatch(
+                        r"[A-Za-z0-9._+-]+",
+                        name
+                    ):
+                        fail("nombre de paquete inválido: " + name)
 
-                if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
-                    fail("SHA-256 inválido para " + name)
+                    if not re.fullmatch(
+                        r"[A-Za-z0-9._+-]+",
+                        architecture
+                    ):
+                        fail("arquitectura inválida: " + architecture)
 
-                if not url.startswith("https://"):
-                    fail("URL insegura para " + name)
+                    if not re.fullmatch(
+                        r"[A-Za-z0-9._+-]+",
+                        os_name
+                    ):
+                        fail("sistema operativo inválido: " + os_name)
 
-                version_key(version)
+                    if not re.fullmatch(
+                        r"[0-9a-fA-F]{64}",
+                        digest
+                    ):
+                        fail("SHA-256 inválido: " + name)
 
-                if not compatible_arch(arch) or not compatible_os(os_name):
-                    continue
+                    if not re.fullmatch(
+                        r"[A-Za-z0-9._+-]+",
+                        filename
+                    ):
+                        fail("nombre de archivo inválido: " + filename)
 
-                dependencies = []
-                if depends not in ("", "-"):
-                    dependencies = [
-                        parse_dependency(item)
-                        for item in depends.split(",")
-                    ]
+                    if not url.startswith("https://"):
+                        fail("URL HTTPS obligatoria: " + name)
 
-                entry = {
-                    "name": name,
-                    "version": version,
-                    "arch": arch,
-                    "os": os_name,
-                    "sha256": digest.lower(),
-                    "filename": filename,
-                    "url": url,
-                    "dependencies": dependencies,
-                }
+                    version_parts(version)
 
-                packages.setdefault(name, []).append(entry)
+                    dependencies = parse_dependencies(
+                        dependency_text
+                    )
 
-    for name in packages:
+                    if not compatible_architecture(architecture):
+                        continue
+
+                    if not compatible_os(os_name):
+                        continue
+
+                    package = {
+                        "name": name,
+                        "version": version,
+                        "architecture": architecture,
+                        "os": os_name,
+                        "sha256": digest.lower(),
+                        "filename": filename,
+                        "url": url,
+                        "dependencies": dependencies,
+                    }
+
+                    packages.setdefault(name, []).append(package)
+
+                    if sum(len(v) for v in packages.values()) > MAX_PACKAGES:
+                        fail("se superó el límite de paquetes del resolvedor")
+
+        except UnicodeError:
+            fail("índice con codificación inválida: " + index_path)
+
+        except OSError as exc:
+            fail("no se pudo leer " + index_path + ": " + str(exc))
+
+    # Remove identical duplicate candidates.
+    for name, candidates in packages.items():
+        unique = {}
+
+        for candidate in candidates:
+            key = (
+                candidate["version"],
+                candidate["sha256"],
+                candidate["url"]
+            )
+
+            unique[key] = candidate
+
+        packages[name] = list(unique.values())
+
         packages[name].sort(
-            key=lambda item: version_key(item["version"]),
+            key=lambda item: version_parts(item["version"]),
             reverse=True
         )
 
     return packages
 
-packages = load_indexes()
+PACKAGES = load_indexes()
 
-if root_package not in packages:
-    fail("no se encontró el paquete compatible: " + root_package)
+# ------------------------------------------------------------
+# Candidate selection
+# ------------------------------------------------------------
 
-def resolve(constraints, selected, visiting, order):
-    # Pick the unresolved package with the fewest viable candidates.
+def candidates_for(name, constraints):
+    result = []
+
+    for candidate in PACKAGES.get(name, []):
+        if satisfies(candidate["version"], constraints):
+            result.append(candidate)
+
+    return result
+
+# ------------------------------------------------------------
+# Dependency graph cycle detection
+# ------------------------------------------------------------
+
+def topological_order(selected, root):
+    visited = set()
+    active = set()
+    order = []
+
+    def visit(name, depth):
+        if depth > MAX_DEPTH:
+            fail("se superó la profundidad máxima de dependencias")
+
+        if name in active:
+            return False
+
+        if name in visited:
+            return True
+
+        if name not in selected:
+            return False
+
+        active.add(name)
+
+        for dependency in selected[name]["dependencies"]:
+            dep_name = dependency[0]
+
+            if not visit(dep_name, depth + 1):
+                return False
+
+        active.remove(name)
+        visited.add(name)
+        order.append(name)
+
+        return True
+
+    if not visit(root, 0):
+        return None
+
+    if len(visited) != len(selected):
+        return None
+
+    return order
+
+# ------------------------------------------------------------
+# Independent backtracking resolver
+# ------------------------------------------------------------
+
+def resolve(constraints, selected, depth=0):
+    if depth > MAX_DEPTH:
+        return None
+
+    # Validate constraints against packages already selected.
+    for name, requirements in constraints.items():
+        if name in selected:
+            if not satisfies(
+                selected[name]["version"],
+                requirements
+            ):
+                return None
+
     unresolved = [
         name for name in constraints
         if name not in selected
     ]
 
+    # Every package has a selected candidate.
     if not unresolved:
-        return selected, order
+        return selected
 
     choices = []
 
     for name in unresolved:
-        candidates = [
-            item for item in packages.get(name, [])
-            if satisfies(
-                item["version"],
-                constraints.get(name, [])
-            )
-        ]
+        candidates = candidates_for(
+            name,
+            constraints[name]
+        )
 
         if not candidates:
             return None
 
-        choices.append((len(candidates), name, candidates))
+        choices.append((
+            len(candidates),
+            name,
+            candidates
+        ))
 
-    _, name, candidates = min(choices, key=lambda item: item[0])
+    # Choose the package with the fewest available candidates.
+    _, name, candidates = min(
+        choices,
+        key=lambda item: item[0]
+    )
 
     for candidate in candidates:
-        new_selected = dict(selected)
-        new_selected[name] = candidate
+        next_selected = dict(selected)
+        next_selected[name] = candidate
 
-        new_constraints = {
+        next_constraints = {
             key: list(value)
             for key, value in constraints.items()
         }
 
-        new_visiting = set(visiting)
-        new_visiting.add(name)
+        invalid = False
 
-        cycle = False
-
+        # Expand dependencies immediately.
         for dep_name, operator, dep_version in candidate["dependencies"]:
-            if dep_name in new_visiting:
-                cycle = True
-                break
+            next_constraints.setdefault(dep_name, [])
 
-            if dep_name not in packages:
-                cycle = True
-                break
-
-            new_constraints.setdefault(dep_name, [])
-
-            if operator:
-                new_constraints[dep_name].append(
+            if operator is not None:
+                next_constraints[dep_name].append(
                     (operator, dep_version)
                 )
 
-            if dep_name in new_selected and not satisfies(
-                new_selected[dep_name]["version"],
-                new_constraints[dep_name]
-            ):
-                cycle = True
-                break
+            if dep_name in next_selected:
+                if not satisfies(
+                    next_selected[dep_name]["version"],
+                    next_constraints[dep_name]
+                ):
+                    invalid = True
+                    break
 
-        if cycle:
+        if invalid:
             continue
 
         result = resolve(
-            new_constraints,
-            new_selected,
-            new_visiting,
-            order
+            next_constraints,
+            next_selected,
+            depth + 1
         )
 
-        if result is not None:
-            final_selected, final_order = result
+        if result is None:
+            continue
 
-            if name not in final_order:
-                final_order = final_order + [name]
+        # Reject cyclic graphs and try another candidate.
+        if topological_order(result, ROOT_PACKAGE) is None:
+            continue
 
-            return final_selected, final_order
+        return result
 
     return None
 
-result = resolve(
-    {root_package: []},
-    {},
-    set(),
-    []
+# ------------------------------------------------------------
+# Resolve requested package
+# ------------------------------------------------------------
+
+if ROOT_PACKAGE not in PACKAGES:
+    fail("paquete no encontrado o incompatible: " + ROOT_PACKAGE)
+
+print(
+    "BACUSP deps: resolviendo " + ROOT_PACKAGE,
+    file=sys.stderr
 )
 
-if result is None:
+selected = resolve(
+    {ROOT_PACKAGE: []},
+    {}
+)
+
+if selected is None:
     fail(
-        "no se pudo resolver el árbol completo. "
-        "Puede haber dependencias ausentes, conflictos de versiones "
-        "o ciclos."
+        "no existe una solución completa. "
+        "Revisá dependencias, versiones y ciclos."
     )
 
-selected, order = result
+order = topological_order(selected, ROOT_PACKAGE)
 
-# Dependencies must be printed before the packages that require them.
-# The recursive search order is used to build a stable topological plan.
+if order is None:
+    fail("se detectó un ciclo de dependencias")
+
+# ------------------------------------------------------------
+# Human-readable check mode
+# ------------------------------------------------------------
+
+if ACTION == "check":
+    print("Árbol de dependencias válido:")
+
+    for name in order:
+        package = selected[name]
+
+        print(
+            "  "
+            + package["name"]
+            + " "
+            + package["version"]
+        )
+
+    raise SystemExit(0)
+
+# ------------------------------------------------------------
+# Machine-readable installation plan
+# ------------------------------------------------------------
+
 for name in order:
-    item = selected[name]
-    print("\t".join([
-        item["name"],
-        item["version"],
-        item["arch"],
-        item["os"],
-        item["sha256"],
-        item["filename"],
-        item["url"],
-        ",".join(dep[0] for dep in item["dependencies"]) or "-"
-    ]))
+    package = selected[name]
+
+    dependencies = ",".join(
+        dep[0] for dep in package["dependencies"]
+    ) or "-"
+
+    fields = [
+        package["name"],
+        package["version"],
+        package["architecture"],
+        package["os"],
+        package["sha256"],
+        package["filename"],
+        package["url"],
+        dependencies
+    ]
+
+    print("\t".join(fields))
+
 PY
