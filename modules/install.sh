@@ -1,39 +1,80 @@
 
 #!/bin/sh
 #
-# BACUSP - Universal Package Installer
-# BP v1 + multiplatform directory variants
-# POSIX shell / Python 3
+# BACUSP 7.6 - Independent Package Installer
+# Project: Bacus-Pkg
+#
+# BP v1 installer + independent repository resolver.
+# No APT, DNF, Pacman, APK, dpkg, rpm or external package managers.
 #
 
 set -eu
 umask 077
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 VERIFY="$SCRIPT_DIR/verify.sh"
+REPO="$SCRIPT_DIR/repo.sh"
+DEPS="$SCRIPT_DIR/deps.sh"
 
 BACUSP_HOME=${BACUSP_HOME:-"${HOME:-/tmp}/.bacusp"}
 APP_ROOT="$BACUSP_HOME/apps"
+CACHE_ROOT="$BACUSP_HOME/cache"
+DB_FILE="$BACUSP_HOME/installed.db"
+
+CHUNK_SIZE=1048576
 
 usage() {
     cat <<'EOF'
-Bacus-Pkg - Instalador universal
+BACUSP 7.6 - Independent Package Installer
 
-Uso:
-  bacusp install ARCHIVO.bp
-  bacusp install ARCHIVO.deb
-  bacusp install ARCHIVO.rpm
-  bacusp install ARCHIVO.apk
-  bacusp install ARCHIVO.pkg.tar.zst
-  bacusp install NOMBRE
+Usage:
+  bacusp install PACKAGE
+  bacusp install FILE.bp
 
-Los paquetes BP multiplataforma instalan solamente la variante
-compatible con el sistema y la arquitectura actuales.
+Examples:
+  bacusp install btop
+  bacusp install ./btop.bp
+
+Independent engine:
+  - Repository index synchronization
+  - Automatic dependency resolution
+  - Direct HTTPS downloads
+  - SHA-256 verification
+  - BP package verification
+  - Version and dependency registration
+
+Supported installation format:
+  BP v1
+
+Native package formats are not delegated to system package managers.
 EOF
 }
 
 error() {
-    printf 'Error: %s\n' "$*" >&2
+    printf 'BACUSP install: ERROR: %s\n' "$*" >&2
+}
+
+info() {
+    printf 'BACUSP install: %s\n' "$*"
+}
+
+valid_name() {
+    case "$1" in
+        ""|.|..|*[!A-Za-z0-9._+-]*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        error "falta la herramienta requerida: $1"
+        exit 1
+    }
 }
 
 if [ "$#" -ne 1 ]; then
@@ -50,52 +91,39 @@ case "$INPUT" in
         ;;
 esac
 
-is_root() {
-    [ "$(id -u)" -eq 0 ]
+require_command python3
+
+mkdir -p "$BACUSP_HOME" "$APP_ROOT" "$CACHE_ROOT"
+chmod 700 "$BACUSP_HOME" "$CACHE_ROOT" 2>/dev/null || :
+
+[ -f "$VERIFY" ] || {
+    error "falta modules/verify.sh"
+    exit 1
 }
 
-run_native() {
-    if is_root; then
-        "$@"
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
-    else
-        error "se necesitan permisos de administrador"
-        exit 1
+install_bp() {
+    PACKAGE_FILE=$1
+    EXPECTED_NAME=${2:-}
+    EXPECTED_VERSION=${3:-}
+
+    [ -f "$PACKAGE_FILE" ] && [ ! -L "$PACKAGE_FILE" ] || {
+        error "el archivo BP no es regular o no existe"
+        return 1
+    }
+
+    info "verificando estructura e integridad BP..."
+
+    if ! sh "$VERIFY" "$PACKAGE_FILE"; then
+        error "el paquete no superó verify.sh"
+        return 1
     fi
-}
 
-# --------------------------------------------------
-# 1. BP package installation
-# --------------------------------------------------
-
-case "$INPUT" in
-    *.bp)
-        [ -f "$INPUT" ] && [ ! -L "$INPUT" ] || {
-            error "se requiere un archivo BP regular"
-            exit 1
-        }
-
-        [ -f "$VERIFY" ] || {
-            error "falta modules/verify.sh"
-            exit 1
-        }
-
-        command -v python3 >/dev/null 2>&1 || {
-            error "se necesita Python 3"
-            exit 1
-        }
-
-        # Verify before extracting.
-        if ! sh "$VERIFY" "$INPUT"; then
-            error "el paquete BP no pasó la verificación"
-            exit 1
-        fi
-
-        mkdir -p "$APP_ROOT"
-        chmod 700 "$BACUSP_HOME" "$APP_ROOT" 2>/dev/null || :
-
-        exec python3 - "$INPUT" "$APP_ROOT" <<'PY'
+    python3 - \
+        "$PACKAGE_FILE" \
+        "$APP_ROOT" \
+        "$DB_FILE" \
+        "$EXPECTED_NAME" \
+        "$EXPECTED_VERSION" <<'PY'
 import os
 import sys
 import re
@@ -106,14 +134,21 @@ import shutil
 import platform
 from urllib.parse import unquote_to_bytes
 
+package = os.path.abspath(sys.argv[1])
+app_root = os.path.realpath(sys.argv[2])
+db_file = os.path.abspath(sys.argv[3])
+expected_name = sys.argv[4]
+expected_version = sys.argv[5]
+
 HEADER = struct.Struct("<8sIIIQQQ")
 ENTRY = struct.Struct("<IB3sQQQ32s")
+
 MAGIC = b"BACUSBP1"
 FORMAT_VERSION = 0x00010000
 CHUNK = 1024 * 1024
 
 def fail(message):
-    raise SystemExit("Error: " + message)
+    raise SystemExit("BACUSP install: ERROR: " + message)
 
 def exact(stream, size):
     data = stream.read(size)
@@ -143,7 +178,9 @@ def safe_path(raw):
     ):
         fail("ruta insegura")
 
-    if any(part in ("", ".", "..") for part in path.split("/")):
+    parts = path.split("/")
+
+    if any(part in ("", ".", "..") for part in parts):
         fail("ruta insegura: " + path)
 
     return path
@@ -182,9 +219,14 @@ def parse_manifest(data):
         result[key] = decoded
 
     required = (
-        "package_name", "version", "description",
-        "target_os", "target_arch", "payload_format",
-        "entrypoint", "file_count"
+        "package_name",
+        "version",
+        "description",
+        "target_os",
+        "target_arch",
+        "payload_format",
+        "entrypoint",
+        "file_count",
     )
 
     for key in required:
@@ -199,55 +241,82 @@ def parse_manifest(data):
     except ValueError:
         fail("file_count inválido")
 
-    if count < 0:
-        fail("file_count negativo")
+    if count < 0 or count > 1000000:
+        fail("cantidad de archivos inválida")
 
     return result, count
 
 def check_target(manifest):
     target_os = manifest["target_os"].lower()
     target_arch = manifest["target_arch"].lower()
-    current_os = sys.platform.lower()
+
+    system = platform.system().lower()
     machine = platform.machine().lower()
 
-    allowed_os = ("any", "unix", "linux", "debian", "chiquios")
+    allowed_os = {
+        "any",
+        "unix",
+        "linux",
+        "debian",
+        "chiquios",
+        "macos",
+        "freebsd",
+        "openbsd",
+        "netbsd",
+    }
 
     if target_os not in allowed_os:
-        fail("sistema objetivo no compatible: " + target_os)
+        fail("sistema objetivo no admitido: " + target_os)
 
-    if target_os == "linux" and not current_os.startswith("linux"):
-        fail("este paquete requiere Linux")
+    if target_os == "unix":
+        if system not in ("linux", "darwin", "freebsd", "openbsd", "netbsd"):
+            fail("el paquete requiere un sistema Unix")
 
-    if target_os == "debian" and not (
-        current_os.startswith("linux")
-        and os.path.exists("/etc/debian_version")
-    ):
-        fail("este paquete requiere Debian o derivado compatible")
+    elif target_os == "linux" and system != "linux":
+        fail("el paquete requiere Linux")
+
+    elif target_os == "macos" and system != "darwin":
+        fail("el paquete requiere macOS")
+
+    elif target_os == "freebsd" and system != "freebsd":
+        fail("el paquete requiere FreeBSD")
+
+    elif target_os == "openbsd" and system != "openbsd":
+        fail("el paquete requiere OpenBSD")
+
+    elif target_os == "netbsd" and system != "netbsd":
+        fail("el paquete requiere NetBSD")
+
+    elif target_os == "debian":
+        if system != "linux" or not os.path.exists("/etc/debian_version"):
+            fail("el paquete requiere Debian o derivado compatible")
 
     aliases = {
-        "any": ("any",),
-        "amd64": ("x86_64", "amd64"),
-        "x86_64": ("x86_64", "amd64"),
-        "i386": ("i386", "i486", "i586", "i686", "x86"),
-        "i486": ("i386", "i486", "i586", "i686", "x86"),
-        "i586": ("i386", "i486", "i586", "i686", "x86"),
-        "i686": ("i386", "i486", "i586", "i686", "x86"),
-        "x86": ("i386", "i486", "i586", "i686", "x86"),
-        "arm64": ("aarch64", "arm64"),
-        "aarch64": ("aarch64", "arm64"),
-        "armhf": ("armv7l", "armhf"),
-        "armv7l": ("armv7l", "armhf"),
-        "riscv64": ("riscv64",),
-        "ppc64el": ("ppc64le", "ppc64el"),
-        "ppc64le": ("ppc64le", "ppc64el"),
+        "any": {"any"},
+        "amd64": {"x86_64", "amd64"},
+        "x86_64": {"x86_64", "amd64"},
+        "i386": {"i386", "i486", "i586", "i686", "x86"},
+        "i486": {"i386", "i486", "i586", "i686", "x86"},
+        "i586": {"i386", "i486", "i586", "i686", "x86"},
+        "i686": {"i386", "i486", "i586", "i686", "x86"},
+        "x86": {"i386", "i486", "i586", "i686", "x86"},
+        "arm64": {"aarch64", "arm64"},
+        "aarch64": {"aarch64", "arm64"},
+        "armhf": {"armv7l", "armhf"},
+        "armv7l": {"armv7l", "armhf"},
+        "armv6": {"armv6l", "arm"},
+        "arm": {"armv6l", "armv7l", "arm"},
+        "riscv64": {"riscv64"},
+        "ppc64el": {"ppc64le", "ppc64el"},
+        "ppc64le": {"ppc64le", "ppc64el"},
     }
 
     if target_arch != "any":
-        compatible = aliases.get(target_arch, (target_arch,))
-        if machine not in compatible:
+        accepted = aliases.get(target_arch, {target_arch})
+        if machine not in accepted:
             fail(
                 "arquitectura incompatible: paquete "
-                + target_arch + ", sistema " + (machine or "desconocido")
+                + target_arch + ", sistema " + machine
             )
 
 def get_variant():
@@ -284,18 +353,18 @@ def get_variant():
     arch_name = arch_aliases.get(machine)
 
     if not os_name or not arch_name:
-        fail("no se pudo identificar el sistema y la arquitectura")
+        fail("no se pudo identificar la variante del sistema")
 
     return os_name + arch_name
 
 def select_variant(manifest, records):
     variants = {
-        item for item in manifest.get("variants", "").split(",")
+        item
+        for item in manifest.get("variants", "").split(",")
         if item
     }
 
     if not variants:
-        # Legacy BP 1.0 package: keep its original layout.
         return records
 
     selected = get_variant()
@@ -323,349 +392,508 @@ def select_variant(manifest, records):
     print("Variante seleccionada:", selected)
     return filtered
 
-def main():
-    package = os.path.abspath(sys.argv[1])
-    app_root = os.path.realpath(sys.argv[2])
+def update_database(name, version, destination, dependencies, digest):
+    os.makedirs(os.path.dirname(db_file), exist_ok=True)
 
+    old_lines = []
+
+    if os.path.isfile(db_file) and not os.path.islink(db_file):
+        with open(db_file, "r", encoding="utf-8") as stream:
+            old_lines = [
+                line.rstrip("\n")
+                for line in stream
+                if line.strip()
+            ]
+
+    # Keep the legacy first two columns:
+    # package_name|installation_path|version|dependencies|sha256
+    new_lines = []
+
+    for line in old_lines:
+        fields = line.split("|")
+
+        if fields[0] == name:
+            continue
+
+        new_lines.append(line)
+
+    dependency_text = ",".join(dependencies) if dependencies else "-"
+
+    new_lines.append(
+        "|".join([
+            name,
+            destination,
+            version,
+            dependency_text,
+            digest,
+        ])
+    )
+
+    directory = os.path.dirname(db_file)
+    fd, temporary = tempfile.mkstemp(
+        prefix=".installed-",
+        dir=directory
+    )
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            for line in new_lines:
+                stream.write(line + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        os.replace(temporary, db_file)
+        os.chmod(db_file, 0o600)
+
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+def main():
     if not os.path.isfile(package) or os.path.islink(package):
-        fail("archivo de paquete inválido")
+        fail("archivo BP inválido")
 
     stage = None
 
-    try:
+    with open(package, "rb") as stream:
+        header = exact(stream, HEADER.size)
+
+        magic, hsize, fmt, flags, msize, tsize, psize = HEADER.unpack(header)
+
+        if magic != MAGIC or hsize != HEADER.size:
+            fail("cabecera BP inválida")
+
+        if fmt != FORMAT_VERSION or flags != 0:
+            fail("versión BP no compatible")
+
+        total = os.fstat(stream.fileno()).st_size
+
+        if HEADER.size + msize + tsize + psize != total:
+            fail("tamaños de sección incorrectos")
+
+        if msize > 16 * 1024 * 1024:
+            fail("manifiesto demasiado grande")
+
+        manifest, count = parse_manifest(exact(stream, msize))
+
+        name = safe_component(manifest["package_name"], "package_name")
+        version = safe_component(manifest["version"], "version")
+
+        if expected_name and name != expected_name:
+            fail(
+                "el nombre del paquete no coincide con el índice: "
+                + name
+            )
+
+        if expected_version and version != expected_version:
+            fail(
+                "la versión del paquete no coincide con el índice: "
+                + version
+            )
+
+        check_target(manifest)
+
+        destination = os.path.join(app_root, name, version)
+
+        if os.path.lexists(destination):
+            fail("esta versión ya está instalada: " + version)
+
+        records = []
+        table_used = 0
+        previous = None
+        next_offset = 0
+        seen = set()
+
+        if count > tsize // (ENTRY.size + 1):
+            fail("cantidad de entradas inválida")
+
+        for _ in range(count):
+            raw_entry = exact(stream, ENTRY.size)
+            table_used += ENTRY.size
+
+            plen, kind, reserved, offset, stored, original, digest = ENTRY.unpack(raw_entry)
+
+            if plen == 0 or reserved != bytes(3) or kind not in (0, 1):
+                fail("entrada inválida en la tabla")
+
+            if plen > tsize - table_used:
+                fail("longitud de ruta fuera de la tabla")
+
+            raw_path = exact(stream, plen)
+            table_used += plen
+
+            path = safe_path(raw_path)
+
+            if raw_path in seen:
+                fail("ruta duplicada: " + path)
+
+            if previous is not None and raw_path <= previous:
+                fail("rutas desordenadas")
+
+            seen.add(raw_path)
+            previous = raw_path
+
+            if kind == 1:
+                if offset or stored or original or digest != bytes(32):
+                    fail("metadatos de directorio inválidos")
+
+            else:
+                if offset != next_offset or stored != original:
+                    fail("offset o tamaño inválido: " + path)
+
+                if stored > psize - next_offset:
+                    fail("archivo fuera del payload: " + path)
+
+                next_offset += stored
+
+            records.append((path, kind, offset, stored, digest))
+
+        if table_used != tsize or next_offset != psize:
+            fail("tabla o payload inconsistente")
+
+        records = select_variant(manifest, records)
+
+        kinds = {
+            path: kind
+            for path, kind, *_ in records
+        }
+
+        for path, kind, *_ in records:
+            parts = path.split("/")
+
+            for index in range(1, len(parts)):
+                parent = "/".join(parts[:index])
+
+                if kinds.get(parent) == 0:
+                    fail("un archivo no puede ser directorio padre: " + parent)
+
+        entrypoint = manifest["entrypoint"]
+
+        if entrypoint:
+            safe_path(entrypoint.encode("utf-8"))
+
+            if kinds.get(entrypoint) != 0:
+                fail("entrypoint no apunta a un archivo")
+
+        dependencies = []
+
+        raw_dependencies = manifest.get("depends", "")
+
+        if raw_dependencies:
+            for dependency in raw_dependencies.split(","):
+                dependency = dependency.strip()
+
+                if not re.fullmatch(
+                    r"[A-Za-z0-9._+-]+(?:(?:>=|<=|=|>|<)[A-Za-z0-9.+-]+)?",
+                    dependency
+                ):
+                    fail("dependencia inválida en el manifiesto: " + dependency)
+
+                dependencies.append(dependency)
+
+        payload_start = HEADER.size + msize + tsize
+
+        stage = tempfile.mkdtemp(
+            prefix=".bp-stage-",
+            dir=app_root
+        )
+
+        for path, kind, offset, stored, expected_digest in records:
+            target = os.path.abspath(
+                os.path.join(stage, *path.split("/"))
+            )
+
+            if os.path.commonpath((stage, target)) != stage:
+                fail("ruta fuera del directorio temporal")
+
+            if kind == 1:
+                os.makedirs(target, mode=0o755, exist_ok=True)
+                continue
+
+            os.makedirs(
+                os.path.dirname(target),
+                mode=0o755,
+                exist_ok=True
+            )
+
+            stream.seek(payload_start + offset)
+            remaining = stored
+            digest = hashlib.sha256()
+
+            with open(target, "xb") as output:
+                while remaining:
+                    block = stream.read(min(CHUNK, remaining))
+
+                    if not block:
+                        fail("payload truncado: " + path)
+
+                    digest.update(block)
+                    output.write(block)
+                    remaining -= len(block)
+
+                output.flush()
+                os.fsync(output.fileno())
+
+            if digest.digest() != expected_digest:
+                fail("SHA-256 incorrecto: " + path)
+
+            os.chmod(
+                target,
+                0o755 if entrypoint == path else 0o644
+            )
+
+        os.makedirs(
+            os.path.dirname(destination),
+            mode=0o755,
+            exist_ok=True
+        )
+
+        # Atomic publication of the extracted version.
+        os.rename(stage, destination)
+        stage = None
+
+        package_digest = hashlib.sha256()
+
         with open(package, "rb") as stream:
-            header = exact(stream, HEADER.size)
+            for block in iter(lambda: stream.read(CHUNK), b""):
+                package_digest.update(block)
 
-            magic, hsize, fmt, flags, msize, tsize, psize = HEADER.unpack(header)
+        update_database(
+            name,
+            version,
+            destination,
+            dependencies,
+            package_digest.hexdigest()
+        )
 
-            if magic != MAGIC or hsize != HEADER.size:
-                fail("cabecera BP inválida")
+        print("Instalación completada.")
+        print("Paquete:", name)
+        print("Versión:", version)
+        print("Dependencias declaradas:", len(dependencies))
+        print("Directorio:", destination)
 
-            if fmt != FORMAT_VERSION or flags != 0:
-                fail("versión BP no compatible")
-
-            total = os.fstat(stream.fileno()).st_size
-
-            if HEADER.size + msize + tsize + psize != total:
-                fail("tamaños de sección incorrectos")
-
-            if msize > 16 * 1024 * 1024:
-                fail("manifiesto demasiado grande")
-
-            manifest, count = parse_manifest(exact(stream, msize))
-
-            name = safe_component(manifest["package_name"], "package_name")
-            version = safe_component(manifest["version"], "version")
-
-            check_target(manifest)
-
-            destination = os.path.join(app_root, name, version)
-
-            if os.path.lexists(destination):
-                fail("el paquete o la versión ya existen: " + destination)
-
-            records = []
-            table_used = 0
-            previous = None
-            next_offset = 0
-            seen = set()
-
-            if count > tsize // (ENTRY.size + 1):
-                fail("cantidad de entradas inválida")
-
-            for _ in range(count):
-                raw_entry = exact(stream, ENTRY.size)
-                table_used += ENTRY.size
-
-                plen, kind, reserved, offset, stored, original, digest = ENTRY.unpack(raw_entry)
-
-                if plen == 0 or reserved != bytes(3) or kind not in (0, 1):
-                    fail("entrada inválida en la tabla")
-
-                if plen > tsize - table_used:
-                    fail("longitud de ruta fuera de la tabla")
-
-                raw_path = exact(stream, plen)
-                table_used += plen
-                path = safe_path(raw_path)
-
-                if raw_path in seen:
-                    fail("ruta duplicada: " + path)
-
-                if previous is not None and raw_path <= previous:
-                    fail("rutas desordenadas")
-
-                seen.add(raw_path)
-                previous = raw_path
-
-                if kind == 1:
-                    if offset or stored or original or digest != bytes(32):
-                        fail("metadatos de directorio inválidos")
-                else:
-                    if offset != next_offset or stored != original:
-                        fail("offset o tamaño inválido: " + path)
-
-                    if stored > psize - next_offset:
-                        fail("archivo fuera del payload: " + path)
-
-                    next_offset += stored
-
-                records.append((path, kind, offset, stored, digest))
-
-            if table_used != tsize or next_offset != psize:
-                fail("tabla o payload inconsistente")
-
-            # Select platform-specific files before extraction.
-            records = select_variant(manifest, records)
-
-            # Reject file/directory conflicts.
-            kinds = {path: kind for path, kind, *_ in records}
-
-            for path, kind, *_ in records:
-                parts = path.split("/")
-                for index in range(1, len(parts)):
-                    parent = "/".join(parts[:index])
-                    if kinds.get(parent) == 0:
-                        fail("un archivo no puede ser directorio padre: " + parent)
-
-            entrypoint = manifest["entrypoint"]
-
-            if entrypoint:
-                safe_path(entrypoint.encode("utf-8"))
-                if kinds.get(entrypoint) != 0:
-                    fail("entrypoint no apunta a un archivo")
-
-            payload_start = HEADER.size + msize + tsize
-
-            stage = tempfile.mkdtemp(prefix=".bp-stage-", dir=app_root)
-
-            for path, kind, offset, stored, expected_digest in records:
-                target = os.path.abspath(
-                    os.path.join(stage, *path.split("/"))
-                )
-
-                if os.path.commonpath((stage, target)) != stage:
-                    fail("ruta fuera del directorio temporal")
-
-                if kind == 1:
-                    os.makedirs(target, mode=0o755, exist_ok=True)
-                    continue
-
-                os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
-
-                stream.seek(payload_start + offset)
-                remaining = stored
-                digest = hashlib.sha256()
-
-                with open(target, "xb") as output:
-                    while remaining:
-                        block = stream.read(min(CHUNK, remaining))
-                        if not block:
-                            fail("payload truncado: " + path)
-
-                        digest.update(block)
-                        output.write(block)
-                        remaining -= len(block)
-
-                if digest.digest() != expected_digest:
-                    fail("SHA-256 incorrecto: " + path)
-
-                os.chmod(target, 0o755 if entrypoint == path else 0o644)
-
-            os.makedirs(os.path.dirname(destination), mode=0o755, exist_ok=True)
-            os.rename(stage, destination)
-            stage = None
-
-            print("Instalación BP completada.")
-            print("Paquete:", name)
-            print("Versión:", version)
-            print("Entradas instaladas:", len(records))
-            print("Directorio:", destination)
-            print("Aviso: SHA-256 verifica integridad, no autenticidad.")
-
-    finally:
-        if stage and os.path.isdir(stage):
-            shutil.rmtree(stage, ignore_errors=True)
+    if stage and os.path.isdir(stage):
+        shutil.rmtree(stage, ignore_errors=True)
 
 try:
     main()
 except (OSError, OverflowError, struct.error, ValueError) as exc:
     fail(str(exc))
 PY
-        ;;
-
-esac
+}
 
 # --------------------------------------------------
-# 2. Native package installation
+# 1. Local BP package
 # --------------------------------------------------
 
 case "$INPUT" in
-    *.deb)
+    *.bp)
         [ -f "$INPUT" ] && [ ! -L "$INPUT" ] || {
-            error "archivo .deb no encontrado o inválido"
+            error "archivo BP local inválido"
             exit 1
         }
 
-        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
-        IFS= read -r ANSWER || exit 2
-        case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
-
-        if command -v apt-get >/dev/null 2>&1; then
-            run_native apt-get install -y "./$INPUT"
-        elif command -v dpkg >/dev/null 2>&1; then
-            run_native dpkg -i "$INPUT"
-        else
-            error "se necesita apt-get o dpkg"
-            exit 1
-        fi
-        exit 0
-        ;;
-
-    *.rpm)
-        [ -f "$INPUT" ] && [ ! -L "$INPUT" ] || {
-            error "archivo .rpm no encontrado o inválido"
-            exit 1
-        }
-
-        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
-        IFS= read -r ANSWER || exit 2
-        case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
-
-        if command -v dnf >/dev/null 2>&1; then
-            run_native dnf install -y "$INPUT"
-        elif command -v zypper >/dev/null 2>&1; then
-            run_native zypper --non-interactive install "$INPUT"
-        elif command -v yum >/dev/null 2>&1; then
-            run_native yum install -y "$INPUT"
-        else
-            error "se necesita dnf, zypper o yum"
-            exit 1
-        fi
-        exit 0
-        ;;
-
-    *.apk)
-        [ -f "$INPUT" ] && [ ! -L "$INPUT" ] || {
-            error "archivo .apk no encontrado o inválido"
-            exit 1
-        }
-
-        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
-        IFS= read -r ANSWER || exit 2
-        case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
-
-        command -v apk >/dev/null 2>&1 || {
-            error "se necesita apk"
-            exit 1
-        }
-
-        run_native apk add -- "$INPUT"
-        exit 0
-        ;;
-
-    *.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.gz)
-        [ -f "$INPUT" ] && [ ! -L "$INPUT" ] || {
-            error "paquete de Arch no encontrado o inválido"
-            exit 1
-        }
-
-        printf 'Se instalará un paquete nativo. ¿Continuar? Escribí SI: '
-        IFS= read -r ANSWER || exit 2
-        case "$ANSWER" in SI|YES) ;; *) exit 0 ;; esac
-
-        command -v pacman >/dev/null 2>&1 || {
-            error "se necesita pacman"
-            exit 1
-        }
-
-        run_native pacman -U -- "$INPUT"
-        exit 0
+        install_bp "$INPUT"
+        exit $?
         ;;
 esac
 
 # --------------------------------------------------
-# 3. Install by package name using system manager
+# 2. Independent repository installation
 # --------------------------------------------------
 
 case "$INPUT" in
-    */*|*://*)
-        error "indica un nombre de paquete o archivo local"
+    */*|*://*|*.deb|*.rpm|*.apk|*.pkg.tar.*)
+        error "ruta o formato no admitido"
         exit 2
         ;;
 esac
 
-# Termux
-if [ -n "${PREFIX:-}" ] && [ -x "${PREFIX}/bin/pkg" ]; then
-    exec "${PREFIX}/bin/pkg" install "$INPUT"
+valid_name "$INPUT" || {
+    error "nombre de paquete inválido"
+    exit 2
+}
+
+[ -f "$REPO" ] || {
+    error "falta modules/repo.sh"
+    exit 1
+}
+
+[ -f "$DEPS" ] || {
+    error "falta modules/deps.sh"
+    exit 1
+}
+
+require_command curl
+
+TMP_DIR=$(mktemp -d "$BACUSP_HOME/install.XXXXXX") || {
+    error "no se pudo crear el directorio temporal"
+    exit 1
+}
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+
+trap cleanup 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+PLAN="$TMP_DIR/plan.tsv"
+
+info "sincronizando índices BACUSP..."
+
+if ! sh "$REPO" sync; then
+    error "no se pudieron sincronizar los repositorios"
+    exit 1
 fi
 
-if command -v apt-get >/dev/null 2>&1; then
-    exec sh -c '
-        if [ "$(id -u)" -eq 0 ]; then
-            exec apt-get install -y -- "$1"
-        elif command -v sudo >/dev/null 2>&1; then
-            exec sudo apt-get install -y -- "$1"
-        else
-            echo "Error: se necesita root o sudo." >&2
+info "resolviendo dependencias de $INPUT..."
+
+if ! sh "$DEPS" resolve "$INPUT" > "$PLAN"; then
+    error "no se pudo resolver el árbol completo"
+    exit 1
+fi
+
+[ -s "$PLAN" ] || {
+    error "el resolvedor no generó un plan"
+    exit 1
+}
+
+# --------------------------------------------------
+# 3. Download and verify every package first
+# --------------------------------------------------
+
+TAB=$(printf '\t')
+COUNT=0
+
+while IFS="$TAB" read -r NAME VERSION ARCH OS_NAME SHA256 FILENAME URL DEPENDENCIES
+do
+    [ -n "$NAME" ] || continue
+
+    valid_name "$NAME" || {
+        error "nombre inválido en el plan"
+        exit 1
+    }
+
+    valid_name "$VERSION" || {
+        error "versión inválida en el plan"
+        exit 1
+    }
+
+    case "$FILENAME" in
+        *.bp) ;;
+        *)
+            error "BACUSP 7.6 solo instala BP: $FILENAME"
             exit 1
-        fi
-    ' sh "$INPUT"
-fi
+            ;;
+    esac
 
-if command -v dnf >/dev/null 2>&1; then
-    exec sh -c '
-        if [ "$(id -u)" -eq 0 ]; then
-            exec dnf install -y "$1"
-        elif command -v sudo >/dev/null 2>&1; then
-            exec sudo dnf install -y "$1"
-        else
-            echo "Error: se necesita root o sudo." >&2
+    case "$SHA256" in
+        *[!0-9a-fA-F]*|"")
+            error "hash SHA-256 inválido para $NAME"
             exit 1
-        fi
-    ' sh "$INPUT"
-fi
+            ;;
+    esac
 
-if command -v zypper >/dev/null 2>&1; then
-    exec sh -c '
-        if [ "$(id -u)" -eq 0 ]; then
-            exec zypper install "$1"
-        elif command -v sudo >/dev/null 2>&1; then
-            exec sudo zypper install "$1"
-        else
-            echo "Error: se necesita root o sudo." >&2
+    [ "${#SHA256}" -eq 64 ] || {
+        error "longitud SHA-256 inválida para $NAME"
+        exit 1
+    }
+
+    case "$URL" in
+        https://*) ;;
+        *)
+            error "URL de descarga insegura para $NAME"
             exit 1
-        fi
-    ' sh "$INPUT"
-fi
+            ;;
+    esac
 
-if command -v apk >/dev/null 2>&1; then
-    exec sh -c '
-        if [ "$(id -u)" -eq 0 ]; then
-            exec apk add "$1"
-        elif command -v sudo >/dev/null 2>&1; then
-            exec sudo apk add "$1"
-        else
-            echo "Error: se necesita root o sudo." >&2
-            exit 1
-        fi
-    ' sh "$INPUT"
-fi
+    PACKAGE_FILE="$TMP_DIR/$COUNT.bp"
 
-if command -v pacman >/dev/null 2>&1; then
-    exec sh -c '
-        if [ "$(id -u)" -eq 0 ]; then
-            exec pacman -S --needed "$1"
-        elif command -v sudo >/dev/null 2>&1; then
-            exec sudo pacman -S --needed "$1"
-        else
-            echo "Error: se necesita root o sudo." >&2
-            exit 1
-        fi
-    ' sh "$INPUT"
-fi
+    info "descargando $NAME $VERSION..."
 
-error "no se detectó un gestor de paquetes compatible"
-printf '%s\n' \
-    "Bacus-Pkg necesita un adaptador específico para este sistema."
-exit 3
+    if ! curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --proto '=https' \
+        --tlsv1.2 \
+        --max-time 180 \
+        "$URL" \
+        -o "$PACKAGE_FILE"
+    then
+        error "falló la descarga de $NAME"
+        exit 1
+    fi
+
+    if ! python3 - "$PACKAGE_FILE" "$SHA256" <<'PY'
+import sys
+import hashlib
+
+path, expected = sys.argv[1:3]
+digest = hashlib.sha256()
+
+with open(path, "rb") as stream:
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+
+if digest.hexdigest().lower() != expected.lower():
+    print("Error: SHA-256 incorrecto.", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        error "integridad incorrecta para $NAME"
+        exit 1
+    fi
+
+    info "verificando formato BP de $NAME..."
+
+    if ! sh "$VERIFY" "$PACKAGE_FILE"; then
+        error "el paquete $NAME no pasó verify.sh"
+        exit 1
+    fi
+
+    COUNT=$((COUNT + 1))
+done < "$PLAN"
+
+[ "$COUNT" -gt 0 ] || {
+    error "el plan no contiene paquetes"
+    exit 1
+}
+
+# --------------------------------------------------
+# 4. Install in dependency order
+# --------------------------------------------------
+
+info "todos los paquetes fueron descargados y verificados"
+info "comenzando instalación en orden de dependencias"
+
+INDEX=0
+
+while IFS="$TAB" read -r NAME VERSION ARCH OS_NAME SHA256 FILENAME URL DEPENDENCIES
+do
+    [ -n "$NAME" ] || continue
+
+    PACKAGE_FILE="$TMP_DIR/$INDEX.bp"
+
+    info "instalando $NAME $VERSION..."
+
+    if ! install_bp "$PACKAGE_FILE" "$NAME" "$VERSION"; then
+        error "no se pudo instalar $NAME"
+        error "la instalación de paquetes anteriores no se revierte automáticamente"
+        exit 1
+    fi
+
+    INDEX=$((INDEX + 1))
+done < "$PLAN"
+
+printf '\n'
+info "instalación finalizada correctamente"
+info "paquetes procesados: $COUNT"
+info "motor: BACUSP independiente"
+info "registro: $DB_FILE"
+
+exit 0
+
